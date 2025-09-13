@@ -1,0 +1,86 @@
+$ErrorActionPreference = 'Stop'
+
+# ===== CONFIG =====
+$PortableCache = "D:\portable-nuget-cache"
+$SolutionRoot  = (Get-Location)
+$LogPath       = Join-Path $SolutionRoot "portable-cache-log.txt"
+
+# ===== Prep =====
+New-Item -ItemType Directory -Force -Path $PortableCache | Out-Null
+"[$(Get-Date -Format s)] Start" | Set-Content $LogPath
+
+# 1) Ensure packages are restored
+dotnet restore | Out-Null
+
+# 2) Find global cache
+$cache = $env:NUGET_PACKAGES
+if ([string]::IsNullOrWhiteSpace($cache)) {
+  $out = dotnet nuget locals global-packages -l
+  if ($out -match "global-packages:\s*(.+)$") { $cache = $Matches[1].Trim() }
+}
+if ([string]::IsNullOrWhiteSpace($cache)) { $cache = Join-Path $env:USERPROFILE ".nuget\packages" }
+
+"Global cache: $cache" | Add-Content $LogPath
+if (-not (Test-Path $cache)) { throw "Global cache '$cache' not found. Did restore succeed under THIS user?" }
+
+# 3) Gather packages from all csproj
+$projects = Get-ChildItem -Recurse -Filter *.csproj
+if (-not $projects) { throw "No .csproj files under $SolutionRoot." }
+
+$all = New-Object System.Collections.Generic.List[object]
+foreach ($proj in $projects) {
+  $jsonText = dotnet list $proj.FullName package --include-transitive --format json
+  if ([string]::IsNullOrWhiteSpace($jsonText)) { continue }
+  $data = $jsonText | ConvertFrom-Json
+  foreach ($tfm in $data.projects.frameworks) {
+    foreach ($dep in ($tfm.topLevelPackages + $tfm.transitivePackages)) {
+      if ($null -eq $dep) { continue }
+      $id  = $dep.id
+      $ver = $dep.resolvedVersion
+      if ([string]::IsNullOrWhiteSpace($ver)) { $ver = $dep.requestedVersion }
+      if ([string]::IsNullOrWhiteSpace($id) -or [string]::IsNullOrWhiteSpace($ver)) { continue }
+      $all.Add([PSCustomObject]@{ Id=$id; Version=$ver })
+    }
+  }
+}
+
+$pkgs = $all | Sort-Object Id, Version -Unique
+"Packages detected: $($pkgs.Count)" | Add-Content $LogPath
+
+if ($pkgs.Count -eq 0) {
+  Write-Warning "No packages detected. See $LogPath"
+  "`nNo packages detected. Ensure your projects actually reference NuGet packages." | Add-Content $LogPath
+  return
+}
+
+# 4) Copy only id\version folders that exist in cache
+$copied = 0; $missing = New-Object System.Collections.Generic.List[string]
+foreach ($p in $pkgs) {
+  $idLower = $p.Id.ToLowerInvariant()
+  $src = Join-Path (Join-Path $cache $idLower) $p.Version
+  $dst = Join-Path (Join-Path $PortableCache $idLower) $p.Version
+
+  if (Test-Path $src) {
+    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Force -Path $dst | Out-Null }
+    Copy-Item -Path (Join-Path $src "*") -Destination $dst -Recurse -Force
+    $copied++
+    "COPIED: $idLower@$($p.Version)" | Add-Content $LogPath
+  } else {
+    $missing.Add("$($p.Id)@$($p.Version)")
+    "MISSING in cache: $($p.Id)@$($p.Version)  (restore may have used a different user/profile/TFM)" | Add-Content $LogPath
+  }
+}
+
+"Copied: $copied package versions" | Add-Content $LogPath
+if ($missing.Count -gt 0) {
+  "Missing list:`n  $($missing -join "`n  ")" | Add-Content $LogPath
+}
+
+Write-Host "Done. Copied $copied package versions to: $PortableCache"
+Write-Host "Log written to: $LogPath"
+Write-Host ""
+Write-Host "On Machine B:"
+Write-Host '  setx NUGET_PACKAGES "D:\portable-nuget-cache"'
+Write-Host '  (open a NEW terminal)'
+Write-Host '  dotnet restore --locked-mode --ignore-failed-sources'
+Write-Host '  dotnet build'
